@@ -1,4 +1,4 @@
-name: Poll Workday Job Boards
+name: Poll ATS Job Boards
 
 on:
   schedule:
@@ -16,14 +16,32 @@ on:
 permissions:
   contents: write
 
-concurrency:
-  group: poll-workday
-  cancel-in-progress: false   # never kill a run that might be mid-commit
-
 jobs:
   poll:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      # One lane per ATS type, each with its own state file
+      # (state/seen_<ats>.json) and its own concurrency group, so a slow
+      # board (Greenhouse has ~6k companies) never blocks or races the
+      # others. POLL_CONCURRENCY is tuned per lane to roughly match how
+      # many companies it's polling.
+      matrix:
+        include:
+          - ats: workday
+            concurrency: "50"
+          - ats: greenhouse
+            concurrency: "60"
+          - ats: lever
+            concurrency: "40"
+          - ats: ashby
+            concurrency: "50"
+          - ats: smartrecruiters
+            concurrency: "40"
+    concurrency:
+      group: poll-${{ matrix.ats }}
+      cancel-in-progress: false   # never kill a run that might be mid-commit
     steps:
       - uses: actions/checkout@v4
 
@@ -36,13 +54,31 @@ jobs:
       - name: Poll job boards
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          POLL_CONCURRENCY: "50"
-        run: python poll.py ${{ inputs.dry_run && '--dry-run' || '' }}
+          POLL_CONCURRENCY: ${{ matrix.concurrency }}
+        run: python poll.py --ats=${{ matrix.ats }} ${{ inputs.dry_run && '--dry-run' || '' }}
 
       - name: Commit updated state
         run: |
           git config user.name "job-alert-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add state/seen.json
-          git diff --staged --quiet || git commit -m "Update seen jobs [skip ci]"
-          git push
+          STATE_FILE="state/seen_${{ matrix.ats }}.json"
+          git add "$STATE_FILE"
+          if git diff --staged --quiet; then
+            echo "No state changes to commit."
+            exit 0
+          fi
+          git commit -m "Update seen jobs (${{ matrix.ats }}) [skip ci]"
+          # Other matrix lanes touch different files but push to the same
+          # branch concurrently, so a non-fast-forward rejection is
+          # expected occasionally -- rebase onto the latest and retry.
+          for i in 1 2 3 4 5; do
+            if git push; then
+              exit 0
+            fi
+            echo "Push rejected (attempt $i/5), rebasing onto latest and retrying..."
+            git fetch origin "${{ github.ref_name }}"
+            git rebase "origin/${{ github.ref_name }}"
+            sleep $(( (RANDOM % 5) + 1 ))
+          done
+          echo "::error::Failed to push state for ${{ matrix.ats }} after retries"
+          exit 1
