@@ -62,6 +62,13 @@ GITHUB_LISTING_SOURCES = [
         "ref": "dev",
         "path": ".github/scripts/listings.json",
     },
+    {
+        "label": "ethan test repo",
+        "owner": "ethancha0",
+        "repo": "internshiptrackerrepotest",
+        "ref": "dev",
+        "path": ".github/scripts/listings.json",
+    },
 ]
 # Category labels in listings.json that count as "software" for
 # SOFTWARE_ROLES_ONLY -- the repo's taxonomy drifted over time ("Software"
