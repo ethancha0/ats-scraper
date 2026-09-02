@@ -1,0 +1,48 @@
+name: Poll Workday Job Boards
+
+on:
+  schedule:
+    # Every 10 minutes. GitHub Actions cron has a practical floor of ~5 min
+    # and can lag further during high-load periods -- treat this as
+    # "roughly every 10 min," not a hard guarantee.
+    - cron: "*/10 * * * *"
+  workflow_dispatch:      # lets you trigger a run manually from the Actions tab
+    inputs:
+      dry_run:
+        description: "Dry run (print instead of posting to Discord)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: poll-workday
+  cancel-in-progress: false   # never kill a run that might be mid-commit
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - name: Poll job boards
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          POLL_CONCURRENCY: "50"
+        run: python poll.py ${{ inputs.dry_run && '--dry-run' || '' }}
+
+      - name: Commit updated state
+        run: |
+          git config user.name "job-alert-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add state/seen.json
+          git diff --staged --quiet || git commit -m "Update seen jobs [skip ci]"
+          git push
