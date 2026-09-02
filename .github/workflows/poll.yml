@@ -39,6 +39,8 @@ jobs:
             concurrency: "50"
           - ats: smartrecruiters
             concurrency: "40"
+          - ats: github
+            concurrency: "1"   # unused (single feed fetch, no per-company fan-out)
     concurrency:
       group: poll-${{ matrix.ats }}
       cancel-in-progress: false   # never kill a run that might be mid-commit

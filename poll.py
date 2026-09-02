@@ -1,12 +1,14 @@
 """
 Poll job boards across multiple ATS platforms (Workday, Greenhouse, Lever,
-Ashby, SmartRecruiters) for new postings and notify a Discord webhook when
-new ones appear.
+Ashby, SmartRecruiters) plus community-maintained GitHub listing repos
+(Simplify Jobs and friends) for new postings, and notify a Discord webhook
+when new ones appear.
 
 Usage:
-    python poll.py                        # full run, all ATS types
+    python poll.py                        # full run, all sources
     python poll.py --ats=workday          # only poll one ATS type
     python poll.py --ats=greenhouse,lever # only poll a subset
+    python poll.py --ats=github           # only poll the GitHub listing sources
     python poll.py --dry-run              # fetch + diff, print instead of posting to Discord
     python poll.py --limit=10             # only process the first N companies (for testing)
 """
@@ -40,7 +42,32 @@ DISCORD_EMBEDS_PER_MESSAGE = 10  # Discord's hard limit per message
 MAX_RETRIES = 2
 RETRY_BACKOFF_SECONDS = 1.5
 
-ATS_TYPES = ("workday", "greenhouse", "lever", "ashby", "smartrecruiters")
+ATS_TYPES = ("workday", "greenhouse", "lever", "ashby", "smartrecruiters", "github")
+
+# --- Community GitHub listing sources ---------------------------------------
+# Repos like SimplifyJobs' Summer-Internships list aggregate postings across
+# thousands of companies (including many with no ATS at all, or a career
+# page too custom to poll directly), maintained by a community + their own
+# scraper. `--ats=github` polls these directly from a raw.githubusercontent
+# JSON file, same dedup-by-id / filter / notify pipeline as everything else.
+# Add more sources here (e.g. a personal test repo) as {owner, repo, ref,
+# path, label} -- `path` should point at a JSON array of objects shaped like
+# Simplify's `listings.json` (id, title, company_name, url, category,
+# active, is_visible, date_posted, locations).
+GITHUB_LISTING_SOURCES = [
+    {
+        "label": "SimplifyJobs/Summer2027-Internships",
+        "owner": "SimplifyJobs",
+        "repo": "Summer2027-Internships",
+        "ref": "dev",
+        "path": ".github/scripts/listings.json",
+    },
+]
+# Category labels in listings.json that count as "software" for
+# SOFTWARE_ROLES_ONLY -- the repo's taxonomy drifted over time ("Software"
+# is current, "Software Engineering" is an older/inconsistent label still
+# used by some entries), so both are accepted.
+GITHUB_SOFTWARE_CATEGORIES = {"software", "software engineering"}
 
 # --- Filtering -------------------------------------------------------------
 # Only notify about internships/co-ops, and only in software/full-stack-ish
@@ -127,6 +154,40 @@ def _parse_epoch_ms(value):
         return datetime.fromtimestamp(value / 1000, tz=timezone.utc)
     except (ValueError, OSError, OverflowError):
         return None
+
+
+def _parse_epoch_seconds(value):
+    if not isinstance(value, (int, float)):
+        return None
+    try:
+        return datetime.fromtimestamp(value, tz=timezone.utc)
+    except (ValueError, OSError, OverflowError):
+        return None
+
+
+def _humanize_delta(posted_at):
+    """Fine-grained "N minutes/hours/days ago" for Discord display -- only
+    used when we have a real timestamp (not Workday's day-level text), so
+    it never overstates precision we don't actually have."""
+    if posted_at is None:
+        return None
+    now = datetime.now(timezone.utc)
+    if posted_at.tzinfo is None:
+        posted_at = posted_at.replace(tzinfo=timezone.utc)
+    seconds = max((now - posted_at).total_seconds(), 0)
+    minutes = seconds / 60
+    if minutes < 1:
+        return "just now"
+    if minutes < 60:
+        n = int(minutes)
+        return f"{n} minute{'s' if n != 1 else ''} ago"
+    hours = minutes / 60
+    if hours < 24:
+        n = int(hours)
+        return f"{n} hour{'s' if n != 1 else ''} ago"
+    days = hours / 24
+    n = int(days)
+    return f"{n} day{'s' if n != 1 else ''} ago"
 
 
 def load_companies(limit=None, ats_filter=None):
@@ -251,12 +312,18 @@ def _parse_postings(company, data):
             path = p.get("externalPath")
             if not path:
                 continue
+            # Workday only ever gives us day-level text (no exact
+            # timestamp in the list response) -- keep it as posted_display
+            # verbatim rather than inventing false precision.
+            posted_text = p.get("postedOn", "")
             results.append(
                 {
                     "id": path,
                     "title": p.get("title", "Untitled role"),
                     "location": p.get("locationsText", ""),
-                    "posted": p.get("postedOn", ""),
+                    "posted": posted_text,
+                    "posted_at": None,
+                    "posted_display": posted_text or "Unknown",
                     "url": f"https://{company['host']}/{company['site']}{path}",
                 }
             )
@@ -274,6 +341,8 @@ def _parse_postings(company, data):
                     "title": j.get("title", "Untitled role"),
                     "location": (j.get("location") or {}).get("name", ""),
                     "posted": _relative_posted_text(posted_at),
+                    "posted_at": posted_at,
+                    "posted_display": _humanize_delta(posted_at) or "Unknown",
                     "url": url,
                 }
             )
@@ -291,6 +360,8 @@ def _parse_postings(company, data):
                     "title": j.get("text", "Untitled role"),
                     "location": (j.get("categories") or {}).get("location", ""),
                     "posted": _relative_posted_text(posted_at),
+                    "posted_at": posted_at,
+                    "posted_display": _humanize_delta(posted_at) or "Unknown",
                     "url": url,
                 }
             )
@@ -308,6 +379,8 @@ def _parse_postings(company, data):
                     "title": j.get("title", "Untitled role"),
                     "location": j.get("location", "") or "",
                     "posted": _relative_posted_text(posted_at),
+                    "posted_at": posted_at,
+                    "posted_display": _humanize_delta(posted_at) or "Unknown",
                     "url": url,
                 }
             )
@@ -324,6 +397,8 @@ def _parse_postings(company, data):
                     "title": j.get("name", "Untitled role"),
                     "location": _format_smartrecruiters_location(j.get("location")),
                     "posted": _relative_posted_text(posted_at),
+                    "posted_at": posted_at,
+                    "posted_display": _humanize_delta(posted_at) or "Unknown",
                     "url": f"https://jobs.smartrecruiters.com/{company['slug']}/{job_id}",
                 }
             )
@@ -350,6 +425,84 @@ async def poll_all(companies):
         return await asyncio.gather(*tasks)
 
 
+async def fetch_github_listing_source(client, source):
+    """Fetch one GitHub-hosted listings.json feed. Never raises -- returns
+    ({company_name: [job, ...]}, None) on success or ({}, error) on
+    failure, same never-crash contract as fetch_company()."""
+    url = f"https://raw.githubusercontent.com/{source['owner']}/{source['repo']}/{source['ref']}/{source['path']}"
+    try:
+        # These feeds run to several MB (thousands of postings across
+        # terms/categories we don't care about) -- give it real headroom.
+        resp = await client.get(url, timeout=REQUEST_TIMEOUT * 4)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:  # noqa: BLE001 - one bad source shouldn't kill the run
+        return {}, f"{type(e).__name__}: {e}"
+
+    by_company = {}
+    for item in data or []:
+        if not item.get("active") or not item.get("is_visible", True):
+            continue
+        category = (item.get("category") or "").strip().lower()
+        if SOFTWARE_ROLES_ONLY and category not in GITHUB_SOFTWARE_CATEGORIES:
+            continue
+        job_id = item.get("id")
+        job_url = item.get("url")
+        company = item.get("company_name")
+        title = item.get("title")
+        if not (job_id and job_url and company and title):
+            continue
+        posted_at = _parse_epoch_seconds(item.get("date_posted"))
+        job = {
+            "id": str(job_id),
+            "title": title,
+            "location": ", ".join(item.get("locations") or []),
+            # Deliberately left blank (not run through _relative_posted_text):
+            # the staleness safety-net below exists to catch a *delayed
+            # poll* of a source whose own postings are always fresh at
+            # fetch time. That assumption doesn't hold here -- this feed's
+            # community-sourced date_posted can legitimately be days old
+            # for a company Simplify only just discovered/added, and the
+            # whole point of including this source is to catch postings our
+            # own direct ATS polling missed. An empty string skips the
+            # staleness check (_looks_recent treats "no signal" as pass);
+            # the id-based new/seen diff is still what gates notifications.
+            "posted": "",
+            "posted_at": posted_at,
+            "posted_display": _humanize_delta(posted_at) or "Unknown",
+            "url": job_url,
+            # Every entry in this feed is already an internship/co-op by
+            # definition (that's the whole repo), and we already gated on
+            # `category` above for SOFTWARE_ROLES_ONLY -- re-running
+            # INTERNSHIP_RE/SOFTWARE_ROLE_RE against the title would only
+            # produce false negatives (e.g. "Software Engineer, Summer
+            # 2027" has no literal "intern" in it) with no benefit.
+            "skip_title_filters": True,
+        }
+        by_company.setdefault(company, []).append(job)
+    return by_company, None
+
+
+async def poll_github_listing_sources():
+    """Fetch every configured GitHub listing source and flatten the result
+    into the same (name, jobs, err) tuple shape fetch_company() produces,
+    one tuple per company found in the feed -- so main()'s existing
+    dedup/filter/notify loop needs no special-casing for this source."""
+    if not GITHUB_LISTING_SOURCES:
+        return []
+    headers = {"User-Agent": "job-alert-bot/1.0 (personal use, low-frequency polling)"}
+    results = []
+    async with httpx.AsyncClient(headers=headers) as client:
+        for source in GITHUB_LISTING_SOURCES:
+            by_company, err = await fetch_github_listing_source(client, source)
+            if err is not None:
+                results.append((source["label"], None, err))
+                continue
+            for company, jobs in by_company.items():
+                results.append((company, jobs, None))
+    return results
+
+
 def notify_discord(new_by_company):
     if not DISCORD_WEBHOOK_URL:
         print("No DISCORD_WEBHOOK_URL set — skipping Discord notification.")
@@ -357,13 +510,23 @@ def notify_discord(new_by_company):
     embeds = []
     for company_name, jobs in new_by_company.items():
         for job in jobs:
-            embeds.append(
-                {
-                    "title": f"{job['title']} — {company_name}"[:256],
-                    "description": job.get("location", "") or "​",
-                    "url": job["url"],
-                }
-            )
+            embed = {
+                "title": f"{job['title']} — {company_name}"[:256],
+                "description": job.get("location", "") or "​",
+                "url": job["url"],
+                "fields": [
+                    {"name": "Posted", "value": job.get("posted_display") or "Unknown", "inline": True}
+                ],
+            }
+            # Only set Discord's native embed timestamp when we have a real
+            # exact posted-at (Workday only gives day-level text) -- an
+            # approximated timestamp would render as misleadingly precise.
+            posted_at = job.get("posted_at")
+            if posted_at is not None:
+                if posted_at.tzinfo is None:
+                    posted_at = posted_at.replace(tzinfo=timezone.utc)
+                embed["timestamp"] = posted_at.isoformat()
+            embeds.append(embed)
     for i in range(0, len(embeds), DISCORD_EMBEDS_PER_MESSAGE):
         chunk = embeds[i : i + DISCORD_EMBEDS_PER_MESSAGE]
         resp = httpx.post(DISCORD_WEBHOOK_URL, json={"embeds": chunk}, timeout=15)
@@ -388,13 +551,17 @@ def main():
 
     companies = load_companies(limit=limit, ats_filter=ats_filter)
     ats_label = ",".join(sorted(ats_filter)) if ats_filter else "all ATS types"
-    print(f"Polling {len(companies)} companies ({ats_label})...")
+    poll_github = not ats_filter or "github" in ats_filter
+    github_note = f" + {len(GITHUB_LISTING_SOURCES)} GitHub listing source(s)" if poll_github else ""
+    print(f"Polling {len(companies)} companies ({ats_label}){github_note}...")
 
     state_file = state_path_for(ats_filter)
     state = load_state(state_file)
     first_run = len(state) == 0
 
     results = asyncio.run(poll_all(companies))
+    if not ats_filter or "github" in ats_filter:
+        results = results + asyncio.run(poll_github_listing_sources())
 
     new_by_company = {}
     errors = []
@@ -415,8 +582,13 @@ def main():
         qualifying = [
             j
             for j in new_jobs
-            if (not INTERNSHIPS_ONLY or INTERNSHIP_RE.search(j["title"]))
-            and (not SOFTWARE_ROLES_ONLY or SOFTWARE_ROLE_RE.search(j["title"]))
+            if (
+                j.get("skip_title_filters")
+                or (
+                    (not INTERNSHIPS_ONLY or INTERNSHIP_RE.search(j["title"]))
+                    and (not SOFTWARE_ROLES_ONLY or SOFTWARE_ROLE_RE.search(j["title"]))
+                )
+            )
             and _looks_recent(j.get("posted", ""))
         ]
         if not qualifying:
@@ -452,7 +624,7 @@ def main():
         print("Dry run — not posting to Discord. New postings found:")
         for name, jobs in new_by_company.items():
             for j in jobs:
-                print(f"  NEW: {name} — {j['title']} ({j['url']})")
+                print(f"  NEW: {name} — {j['title']} [{j.get('posted_display', 'Unknown')}] ({j['url']})")
     elif total_new:
         notify_discord(new_by_company)
 
