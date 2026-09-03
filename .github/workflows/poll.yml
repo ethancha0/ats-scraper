@@ -171,7 +171,12 @@ jobs:
   retrigger:
     needs: [poll]
     runs-on: ubuntu-latest
-    if: ${{ always() && !cancelled() && needs.poll.result != 'skipped' && inputs.dry_run != true && inputs.keep_alive != false }}
+    # workflow_dispatch inputs are empty strings on `schedule` events.
+    # `inputs.keep_alive != false` then evaluates false and used to skip
+    # this job, which killed the 6-hour chain after a cron-started run.
+    # Scheduled runs should always hand off; dispatch still honors the
+    # keep_alive / dry_run checkboxes.
+    if: ${{ always() && !cancelled() && needs.poll.result != 'skipped' && (github.event_name == 'schedule' || (inputs.dry_run != true && inputs.keep_alive != false)) }}
     steps:
       - name: Start the next 6-hour run
         env:
