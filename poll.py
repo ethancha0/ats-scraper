@@ -44,6 +44,17 @@ RETRY_BACKOFF_SECONDS = 1.5
 
 ATS_TYPES = ("workday", "greenhouse", "lever", "ashby", "smartrecruiters", "github")
 
+# Human-readable origin for Discord / dry-run. Direct ATS polls are tagged
+# "(direct)" so they aren't confused with the same company showing up via a
+# GitHub listing feed.
+ATS_SOURCE_LABELS = {
+    "workday": "Workday",
+    "greenhouse": "Greenhouse (direct)",
+    "lever": "Lever (direct)",
+    "ashby": "Ashby (direct)",
+    "smartrecruiters": "SmartRecruiters (direct)",
+}
+
 # --- Community GitHub listing sources ---------------------------------------
 # Repos like SimplifyJobs' Summer-Internships list aggregate postings across
 # thousands of companies (including many with no ATS at all, or a career
@@ -332,6 +343,7 @@ def _parse_postings(company, data):
                     "posted_at": None,
                     "posted_display": posted_text or "Unknown",
                     "url": f"https://{company['host']}/{company['site']}{path}",
+                    "source": ATS_SOURCE_LABELS[ats],
                 }
             )
 
@@ -351,6 +363,7 @@ def _parse_postings(company, data):
                     "posted_at": posted_at,
                     "posted_display": _humanize_delta(posted_at) or "Unknown",
                     "url": url,
+                    "source": ATS_SOURCE_LABELS[ats],
                 }
             )
 
@@ -370,6 +383,7 @@ def _parse_postings(company, data):
                     "posted_at": posted_at,
                     "posted_display": _humanize_delta(posted_at) or "Unknown",
                     "url": url,
+                    "source": ATS_SOURCE_LABELS[ats],
                 }
             )
 
@@ -389,6 +403,7 @@ def _parse_postings(company, data):
                     "posted_at": posted_at,
                     "posted_display": _humanize_delta(posted_at) or "Unknown",
                     "url": url,
+                    "source": ATS_SOURCE_LABELS[ats],
                 }
             )
 
@@ -407,6 +422,7 @@ def _parse_postings(company, data):
                     "posted_at": posted_at,
                     "posted_display": _humanize_delta(posted_at) or "Unknown",
                     "url": f"https://jobs.smartrecruiters.com/{company['slug']}/{job_id}",
+                    "source": ATS_SOURCE_LABELS[ats],
                 }
             )
 
@@ -478,6 +494,7 @@ async def fetch_github_listing_source(client, source):
             "posted_at": posted_at,
             "posted_display": _humanize_delta(posted_at) or "Unknown",
             "url": job_url,
+            "source": source["label"],
             # Every entry in this feed is already an internship/co-op by
             # definition (that's the whole repo), and we already gated on
             # `category` above for SOFTWARE_ROLES_ONLY -- re-running
@@ -522,7 +539,8 @@ def notify_discord(new_by_company):
                 "description": job.get("location", "") or "​",
                 "url": job["url"],
                 "fields": [
-                    {"name": "Posted", "value": job.get("posted_display") or "Unknown", "inline": True}
+                    {"name": "Posted", "value": job.get("posted_display") or "Unknown", "inline": True},
+                    {"name": "Source", "value": job.get("source") or "Unknown", "inline": True},
                 ],
             }
             # Only set Discord's native embed timestamp when we have a real
@@ -631,7 +649,10 @@ def main():
         print("Dry run — not posting to Discord. New postings found:")
         for name, jobs in new_by_company.items():
             for j in jobs:
-                print(f"  NEW: {name} — {j['title']} [{j.get('posted_display', 'Unknown')}] ({j['url']})")
+                print(
+                    f"  NEW: {name} — {j['title']} [{j.get('posted_display', 'Unknown')}] "
+                    f"via {j.get('source', 'Unknown')} ({j['url']})"
+                )
     elif total_new:
         notify_discord(new_by_company)
 
