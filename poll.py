@@ -88,12 +88,17 @@ GITHUB_LISTING_SOURCES = [
 GITHUB_SOFTWARE_CATEGORIES = {"software", "software engineering"}
 
 # --- Filtering -------------------------------------------------------------
-# Only notify about internships/co-ops, and only in software/full-stack-ish
-# roles -- and only ones that still look freshly posted. Set
-# INTERNSHIPS_ONLY=false or SOFTWARE_ROLES_ONLY=false in the environment to
-# loosen either filter.
+# Only notify about internships/co-ops, in software/full-stack-ish roles,
+# in the US, and only ones that still look freshly posted. Set
+# INTERNSHIPS_ONLY=false, SOFTWARE_ROLES_ONLY=false, or US_ONLY=false in
+# the environment to loosen a filter.
 INTERNSHIPS_ONLY = os.environ.get("INTERNSHIPS_ONLY", "true").strip().lower() != "false"
 SOFTWARE_ROLES_ONLY = os.environ.get("SOFTWARE_ROLES_ONLY", "true").strip().lower() != "false"
+# Drop postings whose location is clearly outside the US (e.g. Sydney,
+# Australia). Remote / unspecified locations still pass — most ATS boards
+# in this list are US companies that omit a country. Set US_ONLY=false to
+# disable.
+US_ONLY = os.environ.get("US_ONLY", "true").strip().lower() != "false"
 
 # Word-boundary matched so "International", "cooperation", etc. don't
 # false-positive. Co-ops are explicitly included here (matches "co-op",
@@ -121,12 +126,48 @@ SOFTWARE_ROLE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Country / region names that mean the posting is not US-only. Full names
+# (not 2-letter codes) so "CA" stays California and "IN" stays Indiana.
+_NON_US_LOCATION_RE = re.compile(
+    r"\b("
+    r"australia|canada|united kingdom|\bu\.?k\.?\b|england|scotland|wales|"
+    r"northern ireland|ireland|germany|france|india|singapore|japan|china|"
+    r"netherlands|sweden|switzerland|spain|italy|brazil|(?<!new\s)mexico|"
+    r"south korea|korea|south africa|new zealand|hong kong|taiwan|poland|"
+    r"israel|denmark|norway|finland|belgium|austria|portugal|philippines|"
+    r"indonesia|malaysia|thailand|vietnam|colombia|argentina|chile|"
+    r"czechia|czech republic|romania|hungary|greece|turkey|egypt|"
+    r"nigeria|kenya|pakistan|bangladesh|saudi arabia|qatar|uae|"
+    r"united arab emirates|luxembourg|estonia|lithuania|latvia|"
+    r"new south wales|queensland|victoria(?!\s*,?\s*(?:tx|texas))|"
+    r"ontario|british columbia|quebec|alberta|manitoba|saskatchewan|"
+    r"nova scotia|nsw\b|europe|emea|apac|latam|"
+    r"worldwide|global(?!\s*entry)|international|"
+    r"sydney|melbourne|brisbane|perth|adelaide|"
+    r"toronto|montreal|ottawa|calgary|"
+    r"bangalore|bengaluru|hyderabad|mumbai|new delhi|"
+    r"berlin|tokyo|shanghai|amsterdam|munich|zurich"
+    r")\b",
+    re.IGNORECASE,
+)
+
 # The diff against state/seen_*.json already means "new" = "appeared since
 # our last poll" (~10 min), which is far tighter than "a few hours." This
 # is just a safety net for the one edge case that isn't covered by diffing:
 # if a run is ever skipped/delayed (Actions outage, repo paused, etc.), the
 # next run would otherwise treat a multi-hour or multi-day backlog as "new."
 _STALE_POSTED_MARKERS = ("yesterday", "day ago", "days ago", "week", "month", "30+")
+
+
+def _is_us_location(location):
+    """True unless the location string names a non-US country, region, or
+    city. Empty / Remote / "San Francisco, CA" all pass; "Sydney, New
+    South Wales, Australia" does not. A dual US+Australia listing is
+    also dropped so notifications stay US-only.
+    """
+    if not location or not str(location).strip():
+        return True
+    return _NON_US_LOCATION_RE.search(str(location)) is None
 
 
 def _looks_recent(posted_text):
@@ -615,6 +656,7 @@ def main():
                 )
             )
             and _looks_recent(j.get("posted", ""))
+            and (not US_ONLY or _is_us_location(j.get("location", "")))
         ]
         if not qualifying:
             continue
@@ -634,12 +676,14 @@ def main():
         print(
             f"{total_new_all} existing postings found while seeding "
             f"({would_match_first_run} would have matched filters -- "
-            f"internships_only={INTERNSHIPS_ONLY}, software_roles_only={SOFTWARE_ROLES_ONLY})."
+            f"internships_only={INTERNSHIPS_ONLY}, software_roles_only={SOFTWARE_ROLES_ONLY}, "
+            f"us_only={US_ONLY})."
         )
     else:
         print(
             f"{total_new_all} new postings found; {total_new} matched filters "
-            f"(internships_only={INTERNSHIPS_ONLY}, software_roles_only={SOFTWARE_ROLES_ONLY}) "
+            f"(internships_only={INTERNSHIPS_ONLY}, software_roles_only={SOFTWARE_ROLES_ONLY}, "
+            f"us_only={US_ONLY}) "
             f"across {len(new_by_company)} companies."
         )
 

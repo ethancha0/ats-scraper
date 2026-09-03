@@ -31,7 +31,7 @@ posting appears.
 
 ## Filtering
 
-Two filters apply, both on by default:
+Three filters apply, all on by default:
 
 - **`INTERNSHIPS_ONLY=true`** — only postings with "intern," "internship,"
   or "co-op" in the title (word-boundary matched, so "International" or
@@ -45,11 +45,16 @@ Two filters apply, both on by default:
   catch mechanical/electrical/civil engineering internships), so it filters
   out things like "Marketing Intern" or "Sales Co-op" that only matched on
   the internship keyword.
+- **`US_ONLY=true`** — drop postings whose location names a non-US country,
+  region, or city (e.g. "Sydney, New South Wales, Australia"). Remote,
+  empty, and US locations still notify. A listing that includes both a US
+  and a non-US site is also dropped. This filter applies to GitHub listing
+  sources too.
 
-Set either to `false` in the workflow's `env:` block to loosen it — e.g.
-`SOFTWARE_ROLES_ONLY=false` to see all internships/co-ops regardless of
-department, or `INTERNSHIPS_ONLY=false` to see every software role
-including full-time.
+Set any of these to `false` in the workflow's `env:` block to loosen it —
+e.g. `SOFTWARE_ROLES_ONLY=false` to see all internships/co-ops regardless
+of department, `INTERNSHIPS_ONLY=false` to see every software role
+including full-time, or `US_ONLY=false` to include jobs outside the US.
 
 GitHub listing sources ([below](#github-listing-sources)) skip both title
 regexes — every entry there is already an internship/co-op by definition of
