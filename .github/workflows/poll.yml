@@ -1,46 +1,86 @@
 name: Poll ATS Job Boards
 
 on:
+  # Dead-man switch only. The real cadence is the 6-hour inner loop below;
+  # GitHub's schedule trigger is too laggy for "every few minutes" and
+  # must not start a second 6-hour run while one is already alive.
   schedule:
-    # Every 10 minutes. GitHub Actions cron has a practical floor of ~5 min
-    # and can lag further during high-load periods -- treat this as
-    # "roughly every 10 min," not a hard guarantee.
-    - cron: "*/10 * * * *"
-  workflow_dispatch:      # lets you trigger a run manually from the Actions tab
+    - cron: "0 */2 * * *"
+  workflow_dispatch:
     inputs:
       dry_run:
         description: "Dry run (print instead of posting to Discord)"
         type: boolean
         default: false
+      keep_alive:
+        description: "Re-dispatch another 6-hour run when this one finishes"
+        type: boolean
+        default: true
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
-  poll:
+  # Scheduled ticks are a revive mechanism. Skip if a long-running poll
+  # is already in progress so we don't queue a pile of 6-hour jobs.
+  guard:
+    if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    outputs:
+      continue: ${{ steps.check.outputs.continue }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          others=$(gh run list --repo "${{ github.repository }}" \
+            --workflow poll.yml --status in_progress \
+            --json databaseId \
+            --jq "[.[] | select(.databaseId != ${{ github.run_id }})] | length")
+          if [ "${others:-0}" -gt 0 ]; then
+            echo "Another poll run is already in progress; skipping this scheduled start."
+            echo "continue=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "continue=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  poll:
+    needs: [guard]
+    if: ${{ always() && (github.event_name != 'schedule' || needs.guard.outputs.continue == 'true') }}
+    runs-on: ubuntu-latest
+    # GitHub-hosted jobs hard-cap at 6 hours. Leave headroom so the last
+    # poll + state push can finish before the runner is killed.
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       # One lane per ATS type, each with its own state file
       # (state/seen_<ats>.json) and its own concurrency group, so a slow
       # board (Greenhouse has ~6k companies) never blocks or races the
       # others. POLL_CONCURRENCY is tuned per lane to roughly match how
-      # many companies it's polling.
+      # many companies it's polling. interval is the minimum seconds
+      # between poll *starts* (a pass that already takes longer just
+      # loops immediately).
       matrix:
         include:
           - ats: workday
             concurrency: "50"
+            interval: "60"
           - ats: greenhouse
             concurrency: "60"
+            interval: "60"
           - ats: lever
             concurrency: "40"
+            interval: "60"
           - ats: ashby
             concurrency: "50"
+            interval: "60"
           - ats: smartrecruiters
             concurrency: "40"
+            interval: "60"
           - ats: github
             concurrency: "1"   # unused (single feed fetch, no per-company fan-out)
+            interval: "30"
     concurrency:
       group: poll-${{ matrix.ats }}
       cancel-in-progress: false   # never kill a run that might be mid-commit
@@ -53,34 +93,87 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      - name: Poll job boards
+      - name: Poll until the 6-hour cap
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           POLL_CONCURRENCY: ${{ matrix.concurrency }}
-        run: python poll.py --ats=${{ matrix.ats }} ${{ inputs.dry_run && '--dry-run' || '' }}
-
-      - name: Commit updated state
+          POLL_INTERVAL_SECONDS: ${{ matrix.interval }}
+          STATE_FILE: state/seen_${{ matrix.ats }}.json
+          BRANCH: ${{ github.ref_name }}
+          DRY_FLAG: ${{ inputs.dry_run && '--dry-run' || '' }}
         run: |
+          set -euo pipefail
           git config user.name "job-alert-bot"
           git config user.email "actions@users.noreply.github.com"
-          STATE_FILE="state/seen_${{ matrix.ats }}.json"
-          git add "$STATE_FILE"
-          if git diff --staged --quiet; then
-            echo "No state changes to commit."
+
+          commit_state() {
+            git add "$STATE_FILE"
+            if git diff --staged --quiet; then
+              echo "No state changes to commit."
+              return 0
+            fi
+            git commit -m "Update seen jobs (${{ matrix.ats }}) [skip ci]"
+            # Other matrix lanes touch different files but push to the same
+            # branch concurrently, so a non-fast-forward rejection is
+            # expected occasionally -- rebase onto the latest and retry.
+            for i in 1 2 3 4 5; do
+              if git push; then
+                return 0
+              fi
+              echo "Push rejected (attempt $i/5), rebasing onto latest and retrying..."
+              git fetch origin "$BRANCH"
+              git rebase "origin/$BRANCH"
+              sleep $(( (RANDOM % 5) + 1 ))
+            done
+            echo "::warning::Failed to push state for ${{ matrix.ats }} after retries; continuing the loop"
+            git rebase --abort 2>/dev/null || true
+            return 0
+          }
+
+          run_once() {
+            local started=$SECONDS
+            python poll.py --ats=${{ matrix.ats }} $DRY_FLAG
+            commit_state
+            echo "Pass finished in $((SECONDS - started))s"
+          }
+
+          if [ -n "$DRY_FLAG" ]; then
+            run_once
             exit 0
           fi
-          git commit -m "Update seen jobs (${{ matrix.ats }}) [skip ci]"
-          # Other matrix lanes touch different files but push to the same
-          # branch concurrently, so a non-fast-forward rejection is
-          # expected occasionally -- rebase onto the latest and retry.
-          for i in 1 2 3 4 5; do
-            if git push; then
-              exit 0
+
+          # Stop a few minutes before the job timeout so a slow last pass
+          # and the retrigger job can still complete.
+          LOOP_SECONDS=$((330 * 60))
+          LOOP_END=$((SECONDS + LOOP_SECONDS))
+          pass=0
+          while [ "$SECONDS" -lt "$LOOP_END" ]; do
+            pass=$((pass + 1))
+            echo "===== ${{ matrix.ats }} pass $pass ====="
+            pass_started=$SECONDS
+            run_once || echo "::warning::Pass $pass failed; sleeping and retrying"
+            elapsed=$((SECONDS - pass_started))
+            remaining_loop=$((LOOP_END - SECONDS))
+            if [ "$remaining_loop" -le 0 ]; then
+              break
             fi
-            echo "Push rejected (attempt $i/5), rebasing onto latest and retrying..."
-            git fetch origin "${{ github.ref_name }}"
-            git rebase "origin/${{ github.ref_name }}"
-            sleep $(( (RANDOM % 5) + 1 ))
+            sleep_for=$((POLL_INTERVAL_SECONDS - elapsed))
+            if [ "$sleep_for" -gt "$remaining_loop" ]; then
+              sleep_for=$remaining_loop
+            fi
+            if [ "$sleep_for" -gt 0 ]; then
+              echo "Sleeping ${sleep_for}s to honor start-to-start interval (${POLL_INTERVAL_SECONDS}s)"
+              sleep "$sleep_for"
+            fi
           done
-          echo "::error::Failed to push state for ${{ matrix.ats }} after retries"
-          exit 1
+          echo "Loop budget exhausted after $pass pass(es); handing off to retrigger."
+
+  retrigger:
+    needs: [poll]
+    runs-on: ubuntu-latest
+    if: ${{ always() && !cancelled() && needs.poll.result != 'skipped' && inputs.dry_run != true && inputs.keep_alive != false }}
+    steps:
+      - name: Start the next 6-hour run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run poll.yml --ref "${{ github.ref_name }}"

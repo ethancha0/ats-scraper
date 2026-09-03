@@ -24,10 +24,12 @@ posting appears.
   `state/seen_<ats>.json`, and posts anything new to Discord. Pass
   `--ats=workday,lever` to only poll a subset, or `--ats=github` to poll
   only the listing sources.
-- `.github/workflows/poll.yml` — runs `poll.py` on a cron schedule, once per
-  source in parallel (a matrix job: 5 ATS lanes + 1 GitHub-listings lane),
-  and commits each one's updated state file back to the repo (this is what
-  makes state persist between runs on GitHub's ephemeral runners).
+- `.github/workflows/poll.yml` — one long-running Actions job per source
+  (a matrix: 5 ATS lanes + 1 GitHub-listings lane). Each lane loops
+  `poll.py` for ~5.5 hours on a GitHub-hosted runner (6-hour hard cap),
+  commits `state/seen_<ats>.json` after every pass, then the workflow
+  re-dispatches itself so the next 6-hour block starts immediately. A
+  sparse cron is only a dead-man switch if the chain ever dies.
 
 ## Filtering
 
@@ -66,9 +68,9 @@ instead of a title match.
 
 Recency comes from two layers:
 - **Primary**: a posting only counts as "new" if its ID wasn't in that ATS
-  type's `state/seen_<ats>.json` from the *previous* run — with a 10-minute
-  cron, that means "new" already means "posted in roughly the last 10
-  minutes," well inside "a few hours."
+  type's `state/seen_<ats>.json` from the *previous* pass. Direct ATS lanes
+  re-poll as soon as the last pass finishes (typically a few minutes);
+  the GitHub listings lane targets ~30 seconds start-to-start.
 - **Safety net**: each ATS's own posted-at signal (Workday's coarse
   "Posted Today" / "Posted Yesterday" text; exact timestamps from
   Greenhouse/Lever/Ashby/SmartRecruiters, normalized to the same "today" /
@@ -94,9 +96,11 @@ time zone.
 2. In the repo's **Settings → Secrets and variables → Actions**, add a secret
    named `DISCORD_WEBHOOK_URL` (Discord: Channel Settings → Integrations →
    Webhooks → New Webhook → Copy URL).
-3. Enable Actions on the repo if prompted. The workflow runs automatically on
-   its schedule, or trigger it manually from the **Actions** tab
-   (`workflow_dispatch`).
+3. Enable Actions on the repo if prompted. Trigger it once from the
+   **Actions** tab (`workflow_dispatch`); after that it re-dispatches itself
+   at the end of each ~6-hour block. The 2-hour cron is only there to
+   restart the chain if a run is cancelled or GitHub drops it. To stop it,
+   cancel the in-progress run and re-run with **keep_alive** unchecked.
 4. **First run seeds state only** — for each source, it fetches current
    postings and saves them as "already seen" without sending any Discord
    messages. Otherwise your first run would blast ~18,000 companies' (plus
@@ -187,45 +191,46 @@ with just that one new entry.
   full pass, but more load per batch.
 - `RESULTS_PER_COMPANY` (env var, default 20, Workday only) — how many
   recent postings to pull per company per run.
-- Cron schedule in `poll.yml` — every 10 minutes by default, run as six
-  parallel matrix lanes (one per ATS type, plus one for GitHub listing
-  sources) so a slow lane never blocks the others. GitHub Actions won't
-  reliably go faster than ~5 minutes, and scheduled runs can lag further
-  during peak GitHub load, so treat this as "close to real-time," not
-  guaranteed-instant. See [Polling frequency](#polling-frequency) below
-  before turning this down.
+- Inner-loop interval in `poll.yml` (`matrix.interval`) — minimum seconds
+  between poll *starts* per lane. Direct ATS lanes use 60s (and already
+  take longer than that to finish a full pass, so they effectively loop
+  immediately). The GitHub listings lane uses 30s because it's one feed
+  fetch. See [Polling frequency](#polling-frequency).
 - Only want a subset of sources? Trim the `matrix.include` list in
   `poll.yml`, or filter `data/companies.csv` down to the `ats` values you
   care about.
 
 ## Polling frequency
 
-Can you turn the cron from `*/10 * * * *` down to `*/5 * * * *`? Mechanically
-yes — nothing breaks — but know what you're trading for it:
+GitHub's `on.schedule` cron will not fire every 5 minutes in practice — it
+lags, skips, and has a floor around that anyway. This workflow does not
+rely on it for cadence.
 
-- **GitHub Actions minutes are free either way.** This repo is public, so
-  scheduled-workflow minutes aren't billed regardless of frequency.
-- **The real constraint is each lane's own run time, not the cron value.**
-  Every matrix lane has `concurrency: {group: poll-<lane>, cancel-in-progress:
-  false}` — if a lane is still running when its next scheduled trigger fires,
-  that trigger just queues behind it rather than running in parallel. Lower
-  the cron below how long a lane actually takes and you stop gaining
-  anything: the lane settles into "however long it takes," not the cron
-  interval. The small lanes (Lever ~2.4k companies, Ashby ~3.4k,
-  SmartRecruiters ~2.7k, GitHub ~1 feed) should comfortably clear 5 minutes.
-  Workday (~3.5k) and especially Greenhouse (~6k, and its board API returns
-  a company's *entire* posting list with no "just the newest" mode) are the
-  ones to actually watch — check their run durations in the **Actions** tab
-  after a few cycles before trusting 5 minutes end-to-end.
-- **It doubles request volume** against each ATS's shared public API — still
-  within the realm of "reasonable," but worth knowing per the
-  [etiquette](#etiquette--rate-limits) note below.
-- If Workday/Greenhouse turn out too slow for 5 minutes, options other than
-  "give up on 5 minutes everywhere": split `matrix.include` into two
-  `on.schedule` cron entries (fast one for the small lanes, 10-minute one
-  for Workday/Greenhouse, gated with `if: github.event.schedule == '...'`
-  per lane), or shard a big lane's rows in `companies.csv` across two
-  matrix entries that each poll half the companies.
+Instead each matrix lane is a **single GitHub-hosted job that loops for
+~5.5 hours** (the runner hard-cap is 6 hours), then a `retrigger` job
+calls `gh workflow run` so the next block starts immediately.
+`workflow_dispatch` and `repository_dispatch` are the two event types
+`GITHUB_TOKEN` is allowed to chain without a PAT.
+
+What that actually buys you:
+
+- **GitHub listings lane (~30s).** One `raw.githubusercontent.com` fetch.
+  Test-repo commits and Simplify feed updates should notify within about
+  half a minute of the next pass, not "whenever cron feels like it."
+- **Direct ATS lanes.** Still bounded by how long a full pass takes
+  (Workday/Greenhouse especially — Greenhouse returns each company's
+  entire posting list). If a lane needs 3 minutes, looping it is already
+  as fast as that lane can go; shrinking `interval` further does nothing.
+- **Minutes are still free on a public repo.** You are using 6 runners ×
+  24 hours, not 6 runners × a few minutes per hour. That's intended.
+- **Don't stack cron on top of the loop.** The 2-hour schedule is only a
+  revive if the chain dies (cancelled run, Actions outage). The `guard`
+  job no-ops when a poll is already in progress so you don't queue
+  multiple 6-hour runs.
+
+To halt the chain: cancel the current run, then **Run workflow** with
+**keep_alive** turned off (or just leave it cancelled and don't start
+another).
 
 ## Etiquette / rate limits
 
@@ -233,8 +238,10 @@ This only calls the same public JSON endpoints each company's own careers
 page already calls in your browser — nothing scraped, no auth bypassed. Still,
 be a good citizen:
 - Don't push any one lane's `POLL_CONCURRENCY` much higher than what's
-  already set, or push the cron much below 5 minutes; there's no benefit to
-  you and it's inconsiderate to companies' infrastructure.
+  already set, or drop an ATS lane's loop interval below how long a pass
+  already takes; there's no benefit to you and it's inconsiderate to
+  companies' infrastructure. The GitHub listings interval can stay low —
+  that's one CDN fetch, not thousands of career-site APIs.
 - If any company starts returning errors consistently, `poll.py` already
   logs and skips it rather than retrying aggressively — leave that behavior
   alone rather than adding retry loops.
