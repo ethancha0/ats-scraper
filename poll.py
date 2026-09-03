@@ -63,11 +63,11 @@ GITHUB_LISTING_SOURCES = [
         "path": ".github/scripts/listings.json",
     },
     {
-        "label": "ethan test repo",
+        "label": "ethancha0/internshiptrackerrepotest",
         "owner": "ethancha0",
         "repo": "internshiptrackerrepotest",
-        "ref": "dev",
-        "path": ".github/scripts/listings.json",
+        "ref": "main",
+        "path": "listings.json",
     },
 ]
 # Category labels in listings.json that count as "software" for
