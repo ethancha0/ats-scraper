@@ -55,31 +55,41 @@ jobs:
     strategy:
       fail-fast: false
       # One lane per ATS type, each with its own state file
-      # (state/seen_<ats>.json) and its own concurrency group, so a slow
-      # board (Greenhouse has ~6k companies) never blocks or races the
-      # others. POLL_CONCURRENCY is tuned per lane to roughly match how
-      # many companies it's polling. interval is the minimum seconds
-      # between poll *starts* (a pass that already takes longer just
-      # loops immediately).
+      # (state/seen_<ats>.json, saved to its own state/<ats> branch) and
+      # its own concurrency group, so a slow board (Greenhouse has ~6k
+      # companies) never blocks or races the others. POLL_CONCURRENCY is
+      # tuned per lane to roughly match how many companies it's polling.
+      # rps caps request starts per second for the whole lane (0 = no cap).
+      # interval is the minimum seconds between poll *starts* (a pass that
+      # already takes longer just loops immediately).
       matrix:
         include:
           - ats: workday
             concurrency: "50"
+            rps: "0"
             interval: "60"
+          # Greenhouse's firewall 403'd almost every pass at 60-way
+          # concurrency every 60s (~100 req/s). At 8 req/s a full pass of
+          # ~6k boards takes ~13 minutes.
           - ats: greenhouse
-            concurrency: "60"
-            interval: "60"
+            concurrency: "10"
+            rps: "8"
+            interval: "600"
           - ats: lever
             concurrency: "40"
+            rps: "0"
             interval: "60"
           - ats: ashby
             concurrency: "50"
+            rps: "0"
             interval: "60"
           - ats: smartrecruiters
             concurrency: "40"
+            rps: "0"
             interval: "60"
           - ats: github
             concurrency: "1"   # unused (single feed fetch, no per-company fan-out)
+            rps: "0"
             interval: "30"
     concurrency:
       group: poll-${{ matrix.ats }}
@@ -93,52 +103,86 @@ jobs:
 
       - run: pip install -r requirements.txt
 
+      # State lives on a per-lane branch (state/<ats>) holding a single
+      # force-pushed commit, not in main's history: committing multi-MB
+      # JSON to main every pass pushed the repo toward its size quota, and
+      # six lanes rebasing onto each other made pushes fail.
+      - name: Restore state
+        env:
+          STATE_FILE: state/seen_${{ matrix.ats }}.json
+          STATE_BRANCH: state/${{ matrix.ats }}
+        run: |
+          set -euo pipefail
+          mkdir -p state
+          if git fetch --depth=1 --quiet origin "refs/heads/$STATE_BRANCH"; then
+            git show "FETCH_HEAD:$(basename "$STATE_FILE")" > "$STATE_FILE"
+            echo "Restored $STATE_FILE from $STATE_BRANCH."
+          elif [ -f "$STATE_FILE" ]; then
+            # One-time migration: the last copy committed to this branch
+            # before state moved to its own branch.
+            echo "No $STATE_BRANCH branch yet; starting from the committed $STATE_FILE."
+          else
+            echo "No saved state; the first pass will seed."
+          fi
+
       - name: Poll until the 6-hour cap
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           POLL_CONCURRENCY: ${{ matrix.concurrency }}
+          POLL_RPS: ${{ matrix.rps }}
           POLL_INTERVAL_SECONDS: ${{ matrix.interval }}
+          # Push state at most this often (plus once at the end). Each
+          # force-push leaves the previous commit as garbage for GitHub to
+          # collect, so this keeps that churn down; the cost is that a
+          # runner lost mid-run can re-send up to this window's postings.
+          STATE_PUSH_SECONDS: "600"
           STATE_FILE: state/seen_${{ matrix.ats }}.json
-          BRANCH: ${{ github.ref_name }}
+          STATE_BRANCH: state/${{ matrix.ats }}
           DRY_FLAG: ${{ inputs.dry_run && '--dry-run' || '' }}
         run: |
           set -euo pipefail
           git config user.name "job-alert-bot"
           git config user.email "actions@users.noreply.github.com"
 
-          commit_state() {
-            git add "$STATE_FILE"
-            if git diff --staged --quiet; then
-              echo "No state changes to commit."
+          last_pushed_blob=""
+          last_push_at=-1000000
+          push_state() {
+            [ -f "$STATE_FILE" ] || return 0
+            local blob tree commit
+            blob=$(git hash-object -w "$STATE_FILE")
+            if [ "$blob" = "$last_pushed_blob" ]; then
+              echo "No state changes to push."
               return 0
             fi
-            git commit -m "Update seen jobs (${{ matrix.ats }}) [skip ci]"
-            # Other matrix lanes touch different files but push to the same
-            # branch concurrently, so a non-fast-forward rejection is
-            # expected occasionally -- rebase onto the latest and retry.
-            for i in 1 2 3 4 5; do
-              if git push; then
+            # Build a parentless commit holding just the state file, without
+            # touching the checked-out working tree.
+            tree=$(printf '100644 blob %s\t%s\n' "$blob" "$(basename "$STATE_FILE")" | git mktree)
+            commit=$(git commit-tree "$tree" -m "Seen jobs (${{ matrix.ats }})")
+            for i in 1 2 3; do
+              if git push --force --quiet origin "$commit:refs/heads/$STATE_BRANCH"; then
+                last_pushed_blob=$blob
+                last_push_at=$SECONDS
+                echo "State pushed to $STATE_BRANCH."
                 return 0
               fi
-              echo "Push rejected (attempt $i/5), rebasing onto latest and retrying..."
-              git fetch origin "$BRANCH"
-              git rebase "origin/$BRANCH"
-              sleep $(( (RANDOM % 5) + 1 ))
+              sleep $((i * 5))
             done
-            echo "::warning::Failed to push state for ${{ matrix.ats }} after retries; continuing the loop"
-            git rebase --abort 2>/dev/null || true
+            echo "::warning::Failed to push state for ${{ matrix.ats }}; will retry after the next pass"
             return 0
           }
 
           run_once() {
             local started=$SECONDS
             python poll.py --ats=${{ matrix.ats }} $DRY_FLAG
-            commit_state
+            if [ $((SECONDS - last_push_at)) -ge "$STATE_PUSH_SECONDS" ]; then
+              push_state
+            fi
             echo "Pass finished in $((SECONDS - started))s"
           }
 
           if [ -n "$DRY_FLAG" ]; then
-            run_once
+            # Dry runs never write state anywhere.
+            python poll.py --ats=${{ matrix.ats }} $DRY_FLAG
             exit 0
           fi
 
@@ -166,6 +210,7 @@ jobs:
               sleep "$sleep_for"
             fi
           done
+          push_state
           echo "Loop budget exhausted after $pass pass(es); handing off to retrigger."
 
   retrigger:
@@ -181,4 +226,7 @@ jobs:
       - name: Start the next 6-hour run
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh workflow run poll.yml --ref "${{ github.ref_name }}"
+        # No checkout in this job, so gh can't infer the repo from a local
+        # clone -- without --repo it fails with "not a git repository" and
+        # the chain dies until the next cron tick.
+        run: gh workflow run poll.yml --repo "${{ github.repository }}" --ref "${{ github.ref_name }}"

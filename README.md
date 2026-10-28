@@ -21,54 +21,66 @@ posting appears.
   of companies at once, including many with no pollable ATS at all.
 - `poll.py` — hits every company's endpoint concurrently plus every
   configured GitHub listing source, diffs the returned postings against
-  `state/seen_<ats>.json`, and posts anything new to Discord. Pass
+  `state/seen_<ats>.json`, and posts anything new to Discord. State is
+  `{company: {hashed_job_id: last_seen_day}}`: every id in the current
+  fetch is kept, and ids that stop appearing expire after 45 days. Pass
   `--ats=workday,lever` to only poll a subset, or `--ats=github` to poll
   only the listing sources.
 - `.github/workflows/poll.yml` — one long-running Actions job per source
   (a matrix: 5 ATS lanes + 1 GitHub-listings lane). Each lane loops
   `poll.py` for ~5.5 hours on a GitHub-hosted runner (6-hour hard cap),
-  commits `state/seen_<ats>.json` after every pass, then the workflow
+  force-pushes `seen_<ats>.json` to that lane's own `state/<ats>` branch
+  (at most every 10 minutes, plus once at the end), then the workflow
   re-dispatches itself so the next 6-hour block starts immediately. A
-  sparse cron is only a dead-man switch if the chain ever dies.
+  sparse cron is only a dead-man switch if the chain ever dies. State is
+  kept off `main` so it doesn't bloat the repo's history; the
+  `state/*.json` files still on `main` are only read once, as a migration
+  fallback before a lane's state branch exists.
 
 ## Filtering
 
 Three filters apply, all on by default:
 
 - **`INTERNSHIPS_ONLY=true`** — only postings with "intern," "internship,"
-  or "co-op" in the title (word-boundary matched, so "International" or
-  "Cooperative" won't false-positive; "co-op"/"coop"/"co-ops"/"coops" all
-  match).
+  "co-op," "apprentice," "student," "undergraduate," or "Summer 20XX" in
+  the title (word-boundary matched, so "International" or "Cooperative"
+  won't false-positive). Titles that mention interns without being one
+  ("Intern Program Manager," "Senior …," "University Recruiter") are
+  dropped.
 - **`SOFTWARE_ROLES_ONLY=true`** — the title must *also* look
-  software/full-stack-related: "software," "full-stack," "front-end,"
-  "back-end," "web developer," "DevOps," "SRE," "mobile/iOS/Android
-  engineer," "data engineer," "ML/AI engineer," "computer science," etc.
-  This is an allow-list (not a bare "engineer" match — that would also
-  catch mechanical/electrical/civil engineering internships), so it filters
-  out things like "Marketing Intern" or "Sales Co-op" that only matched on
-  the internship keyword.
-- **`US_ONLY=true`** — drop postings whose location names a non-US country,
-  region, or city (e.g. "Sydney, New South Wales, Australia"). Remote,
-  empty, and US locations still notify. A listing that includes both a US
-  and a non-US site is also dropped. This filter applies to GitHub listing
-  sources too.
+  software/full-stack-related: "software," "developer," "full-stack,"
+  "front-end," "back-end," "DevOps," "SRE," "mobile/iOS/Android," "data
+  engineer," "ML/AI engineer," "forward deployed," "compiler," "computer
+  science," "technology intern," etc. This is an allow-list (not a bare
+  "engineer" match — that would also catch mechanical/electrical/civil
+  engineering internships), so it filters out things like "Marketing
+  Intern" or "Sales Co-op" that only matched on the internship keyword.
+  Against Simplify's hand-labeled listings, it matches ~79% of active
+  "Software" internships, and bare "Systems/Test Engineering Intern" titles
+  (mostly hardware) no longer match.
+- **`US_ONLY=true`** — drop postings with no US location. Where the ATS
+  gives a structured country (SmartRecruiters, Lever, Ashby), that decides
+  it; otherwise the location text is checked against non-US countries,
+  regions, cities, and Canadian province codes ("Toronto, ON"). Remote,
+  empty, and US locations still notify, and a posting listed in both a US
+  and a non-US site is kept. Workday's "2 Locations" summary can't be
+  checked and passes. This filter applies to GitHub listing sources too.
 
 Set any of these to `false` in the workflow's `env:` block to loosen it —
 e.g. `SOFTWARE_ROLES_ONLY=false` to see all internships/co-ops regardless
 of department, `INTERNSHIPS_ONLY=false` to see every software role
 including full-time, or `US_ONLY=false` to include jobs outside the US.
 
-GitHub listing sources ([below](#github-listing-sources)) skip both title
-regexes — every entry there is already an internship/co-op by definition of
-the feed, and already has its own `category` field, so re-running our title
-regex against it would only produce false negatives (e.g. a title like
-"Software Engineer, Summer 2027" has no literal "intern" in it).
-`SOFTWARE_ROLES_ONLY` still applies to that source, just via `category`
-instead of a title match.
+GitHub listing sources ([below](#github-listing-sources)) skip the
+internship regex — every entry there is already an internship/co-op by
+definition of the feed. `SOFTWARE_ROLES_ONLY` still applies: an entry
+counts if its `category` is Software, *or* its title passes the software
+regex (Simplify files plenty of "Software Engineer Intern" roles under
+Hardware or AI/ML/Data).
 
 Recency comes from two layers:
 - **Primary**: a posting only counts as "new" if its ID wasn't in that ATS
-  type's `state/seen_<ats>.json` from the *previous* pass. Direct ATS lanes
+  type's `seen_<ats>.json` from the *previous* pass. Direct ATS lanes
   re-poll as soon as the last pass finishes (typically a few minutes);
   the GitHub listings lane targets ~30 seconds start-to-start.
 - **Safety net**: each ATS's own posted-at signal (Workday's coarse
@@ -105,9 +117,9 @@ time zone.
    postings and saves them as "already seen" without sending any Discord
    messages. Otherwise your first run would blast ~18,000 companies' (plus
    ~900 GitHub-listing) worth of existing listings into your channel at
-   once. Every run after that only notifies on genuinely new postings. (The
-   existing Workday state carries over from before this expansion — every
-   other source starts with a fresh seed run.)
+   once. Every run after that only notifies on genuinely new postings.
+5. If Discord is down or rate limits a post, the undelivered postings are
+   left unseen and retried on the next pass rather than dropped.
 
 ## Endpoint format
 
@@ -136,6 +148,12 @@ tested, open-source adapters, including the hard limits worth knowing:
 - SmartRecruiters paginates; `poll.py` only fetches the first page
   (`limit=100&offset=0`), same "newest handful, not full history"
   philosophy as the Workday cap.
+- Because of those two caps, an internship at a big Workday or
+  SmartRecruiters employer can sit outside the first page. With
+  `INTERNSHIPS_ONLY` on, each of those companies also gets a second,
+  keyword-searched request (`searchText: "intern"` / `q=intern`) whose
+  results are merged in. Override with `WORKDAY_SEARCH_TEXT` /
+  `SMARTRECRUITERS_QUERY` (empty string = skip the extra request).
 
 `data/companies.csv` was seeded from
 [`kalil0321/ats-scrapers`'s `ats-companies/`](https://github.com/kalil0321/ats-scrapers/tree/main/ats-companies)
@@ -167,12 +185,18 @@ their own scraper, and published as a machine-readable `listings.json`
 
 `poll.py` fetches that JSON directly
 (`https://raw.githubusercontent.com/SimplifyJobs/Summer2027-Internships/dev/.github/scripts/listings.json`,
-~11 MB, currently ~900 active software-category postings) and treats each
-entry's `company_name` like any other company: dedup by the entry's stable
-`id`, same Discord notification, same state file (`state/seen_github.json`).
-Filtering there works a little differently, see
-[Filtering](#filtering) above — no title regex, `category` field does the
-software-role gating instead.
+~13 MB) and treats each entry's `company_name` like any other company:
+dedup by the entry's stable `id`, same Discord notification, same state
+file (`seen_github.json`). Filtering there works a little differently, see
+[Filtering](#filtering) above — no internship regex, and `category` (or a
+software-looking title) does the software-role gating.
+
+Many feed entries link straight to a Greenhouse/Lever/Ashby/
+SmartRecruiters/Workday board that's already in `data/companies.csv`. When
+the direct lane's own filters would also pass that title, the feed entry is
+skipped so the same job doesn't ping twice; entries our title regex would
+reject still come through. Set `GITHUB_SKIP_DIRECT_COVERED=false` to
+disable.
 
 Add more sources by appending to `GITHUB_LISTING_SOURCES` in `poll.py` —
 each entry is `{label, owner, repo, ref, path}`, where `path` points at a
@@ -184,17 +208,23 @@ with just that one new entry.
 ## Tuning
 
 - `POLL_CONCURRENCY` (env var) — how many requests run in parallel *within
-  one ATS lane*. The workflow sets this per matrix lane (50 for Workday, 60
+  one ATS lane*. The workflow sets this per matrix lane (50 for Workday, 10
   for Greenhouse, 40 for Lever, 50 for Ashby, 40 for SmartRecruiters; unused
   for the `github` lane, which is a single feed fetch, not a per-company
   fan-out), roughly matched to each lane's company count. Higher = faster
   full pass, but more load per batch.
+- `POLL_RPS` (env var, `matrix.rps`) — max request starts per second for a
+  whole lane (0 = unlimited). Greenhouse is set to 8: at full speed its
+  firewall returned 403 for every board on almost every pass. Any 429 (or
+  a Greenhouse 403) also pauses the whole lane for 30s, doubling up to 5
+  minutes while the block lasts.
 - `RESULTS_PER_COMPANY` (env var, default 20, Workday only) — how many
   recent postings to pull per company per run.
 - Inner-loop interval in `poll.yml` (`matrix.interval`) — minimum seconds
-  between poll *starts* per lane. Direct ATS lanes use 60s (and already
-  take longer than that to finish a full pass, so they effectively loop
-  immediately). The GitHub listings lane uses 30s because it's one feed
+  between poll *starts* per lane. Most direct ATS lanes use 60s (and
+  already take longer than that to finish a full pass, so they effectively
+  loop immediately); Greenhouse uses 600s, though at 8 req/s a pass takes
+  ~13 minutes anyway. The GitHub listings lane uses 30s because it's one feed
   fetch. See [Polling frequency](#polling-frequency).
 - Only want a subset of sources? Trim the `matrix.include` list in
   `poll.yml`, or filter `data/companies.csv` down to the `ats` values you
